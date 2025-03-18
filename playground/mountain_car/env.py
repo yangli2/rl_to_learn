@@ -1,19 +1,24 @@
 """Custom MountainCar Env w/ a reward based on minimum distance from flag."""
 
-import abc
-import jax
+import argparse
+from dataclasses import dataclass, field
+import pickle
+import time
 
 import gymnasium.envs.classic_control
 import gymnasium as gym
-
-from dataclasses import dataclass, field
+import jax
+import scipy
 
 import keras
 import numpy as np
-import functools
+import scipy.special
 
-import os
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+from gae import GeneralizedAdvantageEstimator
+from logger import Logger
+from training_loop import ValueModel, PolicyModel
+
+from matplotlib import pyplot as plt
 
 
 class MountainCar(gym.envs.classic_control.MountainCarEnv):
@@ -64,8 +69,10 @@ class MountainCar(gym.envs.classic_control.MountainCarEnv):
             return observation, reward, terminated, truncated, info
         p, v = observation
         if p > self.best_p:
-            reward = 2
+            reward = 1
             self.best_p = p
+        else:
+            reward = -0.1
         return observation, reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
@@ -89,311 +96,7 @@ class MountainCar(gym.envs.classic_control.MountainCarEnv):
         return observation, info
 
 
-class BaseAdvantageEstimator(abc.ABC):
-    """Abstract base class for advantage estimators."""
-
-    @abc.abstractmethod
-    def __call__(
-        self,
-        rewards: np.typing.ArrayLike,
-        values: np.typing.ArrayLike,
-        truncated: bool,
-        termination_value: float = 100,
-    ) -> np.typing.ArrayLike:
-        """Estimate advantages based on rewards and values."""
-        pass
-
-
-class GeneralizedAdvantageEstimator(BaseAdvantageEstimator):
-    """
-    Generalized Advantage Estimator (GAE) class.
-
-    This class implements the Generalized Advantage Estimation algorithm,
-    which is used to estimate the advantages of actions in reinforcement
-    learning.
-
-    Attributes:
-        gamma (float): The discount factor (gamma) for future rewards.
-        lambd (float): The advantage estimator exponential moving average decay rate.
-    """
-
-    def __init__(self, gamma: float = 0.99, lambd: float = 0.95):
-        """
-        Initializes the Generalized Advantage Estimator.
-
-        Args:
-            gamma (float, optional): The discount factor (gamma). Defaults to 0.99.
-            lambd (float, optional): The GAE lambda parameter. Defaults to 0.95.
-
-        Raises:
-            ValueError: If gamma or lambd are not within the valid range [0, 1].
-        """
-        if not 0 <= gamma <= 1:
-            raise ValueError("Gamma must be between 0 and 1 inclusive.")
-        if not 0 <= lambd <= 1:
-            raise ValueError("Lambda must be between 0 and 1 inclusive.")
-
-        self.gamma = gamma
-        self.lambd = lambd
-
-    def __call__(
-        self,
-        rewards: np.typing.ArrayLike,
-        values: np.typing.ArrayLike,
-        truncated: bool,
-        termination_value: float = 100,
-    ) -> np.typing.ArrayLike:
-        """
-        Calculates the advantages using the GAE algorithm.
-
-        Args:
-            rewards (np.ndarray): A 1D array of rewards received at each timestep.
-            values (np.ndarray): A 1D array of value estimates at each timestep.
-
-        Returns:
-            np.ndarray: A 1D array of estimated advantages at each timestep.
-
-        Raises:
-          ValueError: if rewards and values are not numpy arrays.
-          ValueError: if rewards and values are not 1 dimensional.
-          ValueError: if rewards and values do not have the same length.
-        """
-        if not isinstance(rewards, np.ndarray) or not isinstance(values, np.ndarray):
-            raise ValueError("Rewards and values must be numpy arrays.")
-        if rewards.ndim != 1 or values.ndim != 1:
-            raise ValueError(
-                f"Rewards and values must be 1 dimensional, but rewards: {rewards}, values: {values}"
-            )
-        if len(rewards) != len(values):
-            raise ValueError(
-                "Rewards and values must have the same length, but rewards: {rewards}, values: {values}"
-            )
-
-        advantages = np.zeros_like(rewards)
-
-        # Calculate TD errors (deltas): difference between actual reward and the difference
-        # between discounted future value and current value.
-        deltas = rewards[:-1] + self.gamma * values[1:] - values[:-1]
-
-        # Special handling for final delta - if it is a truncation, simply do not have
-        # it contribute to the advantage calculations; else, use the provided termination
-        # value as the expected value from us achieving a real termination condition for
-        # the episode.
-        last_delta = 0 if truncated else termination_value - values[-1]
-        deltas = np.concatenate([deltas, np.array([last_delta])])
-
-        # Calculate GAE recursively
-        gae_advantage = 0
-        for i in reversed(range(len(advantages))):
-            gae_advantage = deltas[i] + self.gamma * self.lambd * gae_advantage
-            advantages[i] = gae_advantage
-        return advantages
-
-
-@dataclass
-class TrainingMinibatch:
-    states: np.typing.ArrayLike
-    value_labels: np.typing.ArrayLike
-    actions_and_advantages: np.typing.ArrayLike
-
-
-@dataclass
-class Logger:
-    """A data class for logging episode information.
-
-    Attributes:
-        advantage_estimator: A BaseAdvantageEstimator object for estimating advantages.
-        rewards (list[float]): List of rewards received at each step.
-        action_probs (list[float]): List of action probabilities at each step.
-        actions (list[float]): List of actions taken at each step.
-        values (list[float]): List of value estimates at each step.
-        rewards_to_go (list[float]): List of rewards-to-go (calculated at the end of an episode).
-        advantages (list[float]): List of advantages (calculated at the end of an episode).
-    """
-
-    advantage_estimator: BaseAdvantageEstimator
-    rewards: list[float] = field(default_factory=list)
-    action_probs: list[float] = field(default_factory=list)
-    states: list[np.typing.ArrayLike] = field(default_factory=list)
-    actions: list[float] = field(default_factory=list)
-    values: list[float] = field(default_factory=list)
-    # rewards_to_go and advantages require a complete episode (which ends w/ a call to `log()` w/
-    # either `done` or `truncated` being `True`). Once the episode is complete, these vectors will
-    # be computed and `log()` cannot be called again on the object (an error will be thrown if it is).
-    rewards_to_go: None | np.typing.ArrayLike = None
-    advantages: None | np.typing.ArrayLike = None
-
-    @property
-    def is_done(self) -> bool:
-        """Checks if the episode is done.
-
-        Returns:
-            bool: True if the episode is done, False otherwise.
-        """
-        return self.rewards_to_go is not None
-
-    def log(
-        self,
-        reward: float,
-        state: np.typing.ArrayLike,
-        action: float,
-        action_prob: float,
-        value: float,
-        done: bool = False,
-        truncated: bool = False,
-    ) -> None:
-        """Logs information for a single step.
-
-        Args:
-            reward (float): The reward received.
-            action (float): The action taken.
-            action_prob (float): The probability of the action taken.
-            value (float): The value estimate.
-            done (bool, optional): Whether the episode has terminated. Defaults to False.
-            truncated (bool, optional): Whether the episode has been truncated. Defaults to False.
-
-        Raises:
-            RuntimeError: If `log()` is called after the episode is finished.
-        """
-        if self.is_done:
-            raise RuntimeError(
-                "`log()` cannot be called on a `Logger` object if it had "
-                "already been called previously w/ `done` or `truncated` being"
-                " True. Each new episode should be logged by a new Logger "
-                "object."
-            )
-        self.rewards.append(reward)
-        self.states.append(state)
-        self.actions.append(action)
-        self.action_probs.append(action_prob)
-        self.values.append(value)
-        if done or truncated:
-            self.rewards_to_go = np.cumsum(list(reversed(self.rewards)))[::-1]
-            self.advantages = self.advantage_estimator(
-                np.array(self.rewards), np.array(self.values), truncated
-            )
-
-    def training_minibatch(self) -> TrainingMinibatch:
-        assert (
-            self.is_done
-        ), "The episode must be complete before examples can be extracted."
-        return TrainingMinibatch(
-            states=np.vstack(self.states),
-            value_labels=np.reshape(self.rewards_to_go, [-1, 1]),
-            actions_and_advantages=np.hstack(
-                [np.vstack(self.actions), np.reshape(self.advantages, [-1, 1])]
-            ),
-        )
-
-
-@dataclass
-class TrainingLoop:
-    ac: keras.Model
-    optimizer: keras.Optimizer
-    value_only_epochs: int = 5
-    value_and_policy_epochs: int = 2
-    pg_loss_weight: float = 0.001
-    jit_compile: bool = True
-
-    def __post_init__(self):
-        self.optimizer.build(self.ac.trainable_variables)
-        self.train_state = (
-            [v.value for v in self.ac.trainable_variables],
-            [v.value for v in self.ac.non_trainable_variables],
-            [v.value for v in self.optimizer.variables],
-        )
-
-        # jax.value_and_grad only differentiates against the first input.
-        self.grad_fn = jax.value_and_grad(
-            functools.partial(
-                self.compute_loss_and_updates, pg_loss_weight=self.pg_loss_weight
-            ),
-            has_aux=True,
-        )
-        self.value_only_grad_fn = jax.value_and_grad(
-            functools.partial(self.compute_loss_and_updates, pg_loss_weight=0.0),
-            has_aux=True,
-        )
-        if self.jit_compile:
-            self.train_step = jax.jit(
-                functools.partial(self._train_step_helper, grad_fn=self.grad_fn)
-            )
-            self.value_only_train_step = jax.jit(
-                functools.partial(
-                    self._train_step_helper, grad_fn=self.value_only_grad_fn
-                )
-            )
-        else:
-            self.train_step = functools.partial(
-                self._train_step_helper, grad_fn=self.grad_fn
-            )
-            self.value_only_train_step = functools.partial(
-                self._train_step_helper, grad_fn=self.value_only_grad_fn
-            )
-
-    def compute_loss_and_updates(
-        self,
-        trainable_variables,
-        non_trainable_variables,
-        states,
-        actions_and_advantages,
-        value_labels,
-        pg_loss_weight,
-    ):
-        outputs, non_trainable_variables = self.ac.stateless_call(
-            trainable_variables, non_trainable_variables, states, training=True
-        )
-        values = outputs["value"]
-        action_probs = outputs["action_prob"]
-        loss_fn = make_total_loss(pg_loss_weight=pg_loss_weight)
-        loss = loss_fn(actions_and_advantages, action_probs, value_labels, values)
-
-        return loss, non_trainable_variables
-
-    def _train_step_helper(self, state, data, grad_fn):
-        trainable_variables, non_trainable_variables, optimizer_variables = state
-        states, actions_and_advantages, value_labels = data
-
-        (loss, non_trainable_variables), grads = grad_fn(
-            trainable_variables,
-            non_trainable_variables,
-            states,
-            actions_and_advantages,
-            value_labels,
-        )
-        print(f"Grad min: {[jax.numpy.min(g) for g in grads]}")
-        print(f"Grad max: {[jax.numpy.max(g) for g in grads]}")
-        trainable_variables, optimizer_variables = optimizer.stateless_apply(
-            optimizer_variables, grads, trainable_variables
-        )
-        # Return updated state
-        return loss, (
-            trainable_variables,
-            non_trainable_variables,
-            optimizer_variables,
-        )
-
-    def train(self, data: list[list[np.typing.ArrayLike]]):
-        for _ in range(self.value_only_epochs):
-            for batch in data:
-                loss, self.train_state = self.value_only_train_step(
-                    self.train_state, batch
-                )
-            print(f"Value-only loss: {loss}")
-        for _ in range(self.value_and_policy_epochs):
-            for batch in data:
-                loss, self.train_state = self.train_step(self.train_state, batch)
-            print(f"Value-and-policy loss: {loss}")
-
-    def eval(self, states):
-        trainable_variables, non_trainable_variables, _ = self.train_state
-        outputs, _ = self.ac.stateless_call(
-            trainable_variables, non_trainable_variables, states, training=False
-        )
-        return outputs
-
-
-def make_actor_critic(
+def make_policy_network(
     state_dims: int = 2, num_actions: int = 3, layer_sizes: None | list[int] = None
 ) -> keras.Model:
     """Creates an actor-critic model.
@@ -404,25 +107,50 @@ def make_actor_critic(
         layer_sizes (None | list[int], optional): A list of hidden layer sizes. Defaults to None.
 
     Returns:
-        keras.Model: The actor-critic model.
+        keras.Model: The model mapping state to action probabilities.
     """
     # There are two observations from MountainCar
     inputs = keras.Input(shape=(state_dims,))
     x = inputs
     for ls in layer_sizes:
         x = keras.layers.Dense(ls, activation="swish")(x)
-    action_scores = keras.layers.Dense(3)(x)
-    softmax = keras.layers.Softmax(name="action_prob")(action_scores)
+    logits = keras.layers.Dense(num_actions)(x)
+    return keras.Model(inputs, logits)
+
+
+def make_value_network(
+    state_dims: int = 2, layer_sizes: None | list[int] = None
+) -> keras.Model:
+    """Creates an actor-critic model.
+
+    Args:
+        state_dims (int, optional): The number of dimensions in the state space. Defaults to 2.
+        layer_sizes (None | list[int], optional): A list of hidden layer sizes. Defaults to None.
+
+    Returns:
+        keras.Model: The model mapping state to its predicted value.
+    """
+    # There are two observations from MountainCar
+    inputs = keras.Input(shape=(state_dims,))
+    x = inputs
+    for ls in layer_sizes:
+        x = keras.layers.Dense(ls, activation="swish")(x)
     value = keras.layers.Dense(1, name="value")(x)
-    return keras.Model(inputs, {"action_prob": softmax, "value": value})
+    return keras.Model(inputs, value)
 
 
-def simulate_episode(ac: TrainingLoop, env: gym.Env, render: bool = False) -> Logger:
+def simulate_episode(
+    m_policy: PolicyModel,
+    env: gym.Env,
+    m_value: ValueModel | None = None,
+    render: bool = False,
+) -> Logger:
     """Simulates a single episode.
 
     Args:
-        ac (keras.Model): The actor-critic model wrapped in a TrainingLoop.
+        m_policy: The policy model.
         env (gym.Env): The environment.
+        m_value: The (optional) value model. If present, will use advantage as the weight; otherwise, will use reward or reward-to-go.
         render (bool, optional): Whether to render the environment. Defaults to False.
 
     Returns:
@@ -430,23 +158,30 @@ def simulate_episode(ac: TrainingLoop, env: gym.Env, render: bool = False) -> Lo
     """
     env.render_mode = "human" if render else None
     obs, _ = env.reset()
-    logger = Logger(advantage_estimator=GeneralizedAdvantageEstimator())
+    ae = None if m_value is None else GeneralizedAdvantageEstimator()
+    logger = Logger(advantage_estimator=ae)
     done = False
     while not done:
-        output = ac.eval(np.reshape(obs, [1, -1]))
-        action_probs = np.asarray(output["action_prob"][0]).copy()
-        value = output["value"][0][0]
-        # Jax has some numerical jitter making the probs negative or not sum to 1.
-        action_probs = np.clip(action_probs, 0.0, 1.0)
-        action_probs[-1] = 1 - sum(action_probs[:-1])
-        action = np.random.choice(range(3), p=action_probs)
+        action_logits = m_policy.eval(np.reshape(obs, [1, -1]))
+        num_actions = action_logits.shape[1]
+        try:
+            action_probs = scipy.special.softmax(action_logits[0])
+            action = np.random.choice(range(num_actions), p=action_probs)
+        except:
+            print(action_probs)
+            raise
         obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
+        value = (
+            m_value.eval(np.reshape(obs, [1, -1]))[0][0]
+            if m_value is not None
+            else None
+        )
         logger.log(
             reward=reward,
             state=obs,
             action=action,
-            action_prob=action_probs[action],
+            action_logits=action_logits[0],
             value=value,
             done=terminated,
             truncated=truncated,
@@ -454,53 +189,156 @@ def simulate_episode(ac: TrainingLoop, env: gym.Env, render: bool = False) -> Lo
     return logger
 
 
-def make_pg_loss(loss_weight: float = 0.1):
-    def _pg_loss(actions_and_advantages, action_probs):
-        actions = actions_and_advantages[:, 0]
-        advantages = keras.ops.reshape(actions_and_advantages[:, 1], [-1, 1])
-        logps = keras.ops.log(action_probs[keras.ops.cast(actions, dtype="int32")])
-        return -loss_weight * keras.ops.sum(logps * advantages)
+@dataclass
+class ReplayBuffer:
+    num_batches: int = 128
+    batches_buffer: list[list[np.typing.ArrayLike]] = field(default_factory=list)
 
-    return _pg_loss
-
-
-def make_total_loss(pg_loss_weight: float = 0.1):
-    pg_loss = make_pg_loss(loss_weight=pg_loss_weight)
-
-    def _total_loss(actions_and_advantages, action_probs, value_labels, values):
-        return pg_loss(
-            actions_and_advantages, action_probs
-        ) + keras.losses.MeanSquaredError()(value_labels, values)
-
-    return _total_loss
+    def maybe_add(
+        self, batch: list[np.typing.ArrayLike], replacement_prob: float = 0.1
+    ) -> None:
+        if len(self.batches_buffer) < self.num_batches:
+            self.batches_buffer.append(batch)
+            return
+        # We have a full buffer. Replace an existing batch w/ some probability
+        if np.random.random() <= replacement_prob:
+            self.batches_buffer[np.random.randint(self.num_batches)] = batch
 
 
-env = MountainCar(render_mode="human")
-env.metadata["render_fps"] = 60 * 10
-env = MountainCar()
+@dataclass
+class Schedule:
+    key_points: list[int]
+    key_values: list[float]
+    interpolation_methods: list[str] = field(default_factory=list)
 
-ac = make_actor_critic(layer_sizes=[256, 256, 256])
-optimizer = keras.optimizers.RMSprop(learning_rate=0.001)
+    def __post_init__(self):
+        assert self.key_points == sorted(self.key_points)
+        assert self.key_points[0] == 0
+        if not self.interpolation_methods:
+            self.interpolation_methods = ["step"] * (len(self.key_points) - 1)
 
-training_loop = TrainingLoop(
-    ac=ac,
-    optimizer=optimizer,
-    value_only_epochs=100,
-    value_and_policy_epochs=2,
-    pg_loss_weight=1e-4,
-    jit_compile=True,
-)
+    def value(self, x: int) -> float:
+        stage = sum(x > kp for kp in self.key_points)
+        if stage >= len(self.key_points):
+            return self.key_values[-1]
+        if stage == 0:
+            return self.key_values[0]
+        # stage is somewhere in between
+        interpolation_method = self.interpolation_methods[stage - 1]
+        if interpolation_method == "step":
+            return self.key_values[stage - 1]
+        elif interpolation_method == "linear":
+            p = float(x - self.key_points[stage - 1]) / float(
+                self.key_points[stage] - self.key_points[stage - 1]
+            )
+            return p * self.key_values[stage] + (1 - p) * self.key_values[stage - 1]
+        else:
+            raise ValueError(f"Unknown interpolation method {interpolation_method}")
 
-inner_iters = 5
-for iter in range(50):
-    batches = []
-    for sim_iter in range(inner_iters):
-        logger = simulate_episode(
-            training_loop, env, render=iter % 10 == 0 and sim_iter == 0
+
+@dataclass
+class EpisodeMetrics:
+    total_reward: float = 0.0
+    action_prob_entropy_mean: float = 0.0
+    action_prob_entropy_std: float = 0.0
+
+
+def simulate_and_log(
+    m_policy, env, policy_batches, m_value=None, value_batches=None, render=False
+) -> EpisodeMetrics:
+    metrics = EpisodeMetrics()
+    if value_batches is not None:
+        assert m_value is not None
+    logger = simulate_episode(m_policy, env, m_value=m_value, render=render)
+    action_probs = [scipy.special.softmax(logit) for logit in logger.action_logits]
+    action_prob_entropy = [np.sum(p * np.log(p)) for p in action_probs]
+    metrics = EpisodeMetrics(
+        total_reward=logger.rewards_to_go[0],
+        action_prob_entropy_mean=np.mean(action_prob_entropy),
+        action_prob_entropy_std=np.std(action_prob_entropy),
+    )
+
+    minibatch = logger.training_minibatch()
+    policy_batches.append([minibatch.states, minibatch.actions_and_weights])
+    if value_batches is not None:
+        value_batches.append([minibatch.states, minibatch.rewards_to_go])
+
+    return metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--result_path_prefix", type=str, default="result")
+    result_path_prefix = parser.parse_args().result_path_prefix
+    timestamp = str(int(time.time() * 1000))
+    result_path = f"{result_path_prefix}_{timestamp}.pkl"
+
+    env = MountainCar(render_mode="human")
+    env.metadata["render_fps"] = 60 * 100
+    env = MountainCar()
+
+    value_net = make_value_network(layer_sizes=[256, 256, 256])
+    value_optimizer = keras.optimizers.Adam(learning_rate=0.001)
+    policy_net = make_policy_network(layer_sizes=[32, 32, 32])
+    policy_optimizer = keras.optimizers.Adadelta(learning_rate=0.01, clipnorm=10)
+    # optimizer = keras.optimizers.RMSprop(learning_rate=0.001)
+
+    # m_value = ValueModel(value_net, optimizer=value_optimizer)
+    m_value = None
+    m_policy = PolicyModel(policy_net, optimizer=policy_optimizer)
+
+    inner_iters = 10
+    policy_epochs_schedule = Schedule(key_points=[0, 0], key_values=[0, 5])
+    mean_total_rewards = []
+    mean_action_prob_entropy_means = []
+    mean_action_prob_entropy_stds = []
+    plt.ion()
+    plt.show(block=False)
+    plt.pause(0.1)
+
+    for iter in range(500):
+        # value_batches = []
+        policy_batches = []
+        episode_metrics = []
+        for sim_iter in range(inner_iters):
+            episode_metrics.append(
+                simulate_and_log(
+                    m_policy,
+                    env,
+                    policy_batches,
+                    m_value=m_value,
+                    value_batches=None,
+                    render=iter % 10 == 0 and sim_iter == 0,
+                )
+            )
+
+        # m_value.train(value_batches, num_epochs=1)
+        m_policy.train(policy_batches, num_epochs=1)
+        mean_total_rewards.append(np.mean([em.total_reward for em in episode_metrics]))
+        mean_action_prob_entropy_means.append(
+            np.mean([em.action_prob_entropy_mean for em in episode_metrics])
         )
-        print(f"Total reward: {sum(logger.rewards)}")
-        minibatch = logger.training_minibatch()
-        batches.append(
-            [minibatch.states, minibatch.actions_and_advantages, minibatch.value_labels]
+        mean_action_prob_entropy_stds.append(
+            np.mean([em.action_prob_entropy_std for em in episode_metrics])
         )
-    training_loop.train(batches)
+        plt.subplot(3, 1, 1)
+        plt.plot(mean_total_rewards)
+        plt.subplot(3, 1, 2)
+        plt.plot(mean_action_prob_entropy_means)
+        plt.subplot(3, 1, 3)
+        plt.plot(mean_action_prob_entropy_stds)
+        plt.pause(0.1)
+
+    with open(result_path, "wb") as f:
+        pickle.dump(
+            [
+                mean_total_rewards,
+                mean_action_prob_entropy_means,
+                mean_action_prob_entropy_stds,
+            ],
+            f,
+        )
+
+
+if __name__ == "__main__":
+    main()
