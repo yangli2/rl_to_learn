@@ -1,0 +1,6 @@
+gymnax
+jax
+numpy
+flax
+matplotlib
+rejax
